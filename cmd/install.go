@@ -31,6 +31,7 @@ type k3sExecOptions struct {
 	ExtraArgs    string
 	FlannelIPSec bool
 	NoExtras     bool
+	NetSwitch    bool
 }
 
 // PinnedK3sChannel will track the stable channel of the K3s API,
@@ -40,9 +41,9 @@ type k3sExecOptions struct {
 // https://update.k3s.io/v1-release/channels
 const PinnedK3sChannel = "stable"
 
-const getScript = "curl -sfL https://get.k3s.io"
-				   curl -sfL https://get.k3s.io | sh -
-const getScript = "curl -sfL https://rancher-mirror.rancher.cn/k3s/k3s-install.sh | INSTALL_K3S_MIRROR=cn sh -"
+// const getScript = "curl -sfL https://get.k3s.io"
+// const getScript = "curl -sfL https://rancher-mirror.rancher.cn/k3s/k3s-install.sh"
+const getScript = "curl -sfL ghproxy.com/https://raw.githubusercontent.com/chreadppp/k3sup_cn/master/k3s-install-cn.sh"
 
 // MakeInstall creates the install command
 func MakeInstall() *cobra.Command {
@@ -101,6 +102,7 @@ func MakeInstall() *cobra.Command {
 	command.Flags().String("local-path", "kubeconfig", "Local path to save the kubeconfig file")
 	command.Flags().String("context", "default", "Set the name of the kubeconfig context.")
 	command.Flags().Bool("no-extras", false, `Disable "servicelb" and "traefik"`)
+	command.Flags().Bool("net-switch", false, `use chinese network.`)
 
 	command.Flags().Bool("ipsec", false, "Enforces and/or activates optional extra argument for k3s: flannel-backend option: ipsec")
 	command.Flags().Bool("merge", false, `Merge the config with existing kubeconfig if it already exists.
@@ -185,6 +187,10 @@ Provide the --local-path flag with --merge if a kubeconfig already exists in som
 		if err != nil {
 			return err
 		}
+		k3sNetSwitch, err := command.Flags().GetBool("net-switch")
+		if err != nil {
+			return err
+		}
 
 		flannelIPSec, _ := command.Flags().GetBool("ipsec")
 
@@ -245,6 +251,7 @@ Provide the --local-path flag with --merge if a kubeconfig already exists in som
 				FlannelIPSec: flannelIPSec,
 				NoExtras:     k3sNoExtras,
 				ExtraArgs:    k3sExtraArgs,
+				NetSwitch:    k3sNetSwitch,
 			})
 
 		if len(k3sVersion) == 0 && len(k3sChannel) == 0 {
@@ -598,6 +605,10 @@ func makeInstallExec(cluster bool, host, tlsSAN string, options k3sExecOptions) 
 	}
 
 	installExec := "INSTALL_K3S_EXEC='server"
+	if !options.NetSwitch {
+		installExec = " INSTALL_K3S_MIRROR=cn " + installExec
+	}
+
 	if cluster {
 		installExec += " --cluster-init"
 	}
