@@ -42,8 +42,8 @@ type k3sExecOptions struct {
 const PinnedK3sChannel = "stable"
 
 // const getScript = "curl -sfL https://get.k3s.io"
-// const getScript = "curl -sfL https://rancher-mirror.rancher.cn/k3s/k3s-install.sh"
-const getScript = "curl -sfL ghproxy.com/https://raw.githubusercontent.com/chreadppp/k3sup_cn/master/k3s-install-cn.sh"
+// const getScript = "curl -sfL ghproxy.com/https://raw.githubusercontent.com/chreadppp/k3sup_cn/master/k3s-install-cn.sh"
+const getScript = "curl -sfL https://rancher-mirror.rancher.cn/k3s/k3s-install.sh"
 
 // MakeInstall creates the install command
 func MakeInstall() *cobra.Command {
@@ -102,7 +102,7 @@ func MakeInstall() *cobra.Command {
 	command.Flags().String("local-path", "kubeconfig", "Local path to save the kubeconfig file")
 	command.Flags().String("context", "default", "Set the name of the kubeconfig context.")
 	command.Flags().Bool("no-extras", false, `Disable "servicelb" and "traefik"`)
-	command.Flags().Bool("net-switch", false, `use chinese network.`)
+	command.Flags().Bool("net-switch", true, `default use rancher-mirror.rancher.cn ,set "false" use github.com .`)
 
 	command.Flags().Bool("ipsec", false, "Enforces and/or activates optional extra argument for k3s: flannel-backend option: ipsec")
 	command.Flags().Bool("merge", false, `Merge the config with existing kubeconfig if it already exists.
@@ -605,7 +605,7 @@ func makeInstallExec(cluster bool, host, tlsSAN string, options k3sExecOptions) 
 	}
 
 	installExec := "INSTALL_K3S_EXEC='server"
-	if !options.NetSwitch {
+	if options.NetSwitch {
 		installExec = " INSTALL_K3S_MIRROR=cn " + installExec
 	}
 
