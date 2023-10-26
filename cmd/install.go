@@ -102,7 +102,7 @@ func MakeInstall() *cobra.Command {
 	command.Flags().String("local-path", "kubeconfig", "Local path to save the kubeconfig file")
 	command.Flags().String("context", "default", "Set the name of the kubeconfig context.")
 	command.Flags().Bool("no-extras", false, `Disable "servicelb" and "traefik"`)
-	command.Flags().Bool("net-switch", true, `default use rancher-mirror.rancher.cn ,set "false" use github.com .`)
+	command.Flags().Bool("net-switch", true, `default use rancher-mirror.rancher.cn ,set "false" use github.com.`)
 
 	command.Flags().Bool("ipsec", false, "Enforces and/or activates optional extra argument for k3s: flannel-backend option: ipsec")
 	command.Flags().Bool("merge", false, `Merge the config with existing kubeconfig if it already exists.

@@ -2,11 +2,10 @@ package ssh
 
 import (
 	"bytes"
+	"golang.org/x/crypto/ssh"
 	"io"
 	"os"
 	"sync"
-
-	"golang.org/x/crypto/ssh"
 )
 
 // SSHOperator executes commands on a remote machine over an SSH session
