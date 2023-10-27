@@ -1,9 +1,5 @@
 # k3sup 🚀 (said 'ketchup')
 
-<img src="docs/assets/k3sup.png" width="20%" alt="k3sup logo">
-
-本项目fork自alexellis的[k3sup](https://github.com/alexellis/k3sup)
-
 k3sup 是一个轻量级实用程序，可以在任何本地或远程虚拟机上使用 k3s 从零到启动 k8s 集群。
 只需要 ssh 访问和 k3sup 二进制文件，就能获得 kubectl 访问权限。
 
@@ -130,4 +126,8 @@ k3sup join --user root --server-ip $SERVER1 --ip $AGENT1
 export KUBECONFIG=`pwd`/kubeconfig
 kubectl get node
 ```
+
+<img src="docs/assets/k3sup.png" width="20%" alt="k3sup logo">
+
+本项目fork自alexellis的[k3sup](https://github.com/alexellis/k3sup)
 
