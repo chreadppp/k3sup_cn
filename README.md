@@ -69,7 +69,60 @@ k3sup install --host $HOST --user ubuntu \
 * `--print-command` - 打印出命令，通过SSH发送到远程计算机
 * `--datastore` - 用于将 SQL 连接字符串传递给 k3s --datastore-endpoint 的标志。必须使用 k3s 要求的格式。可参考[文档](https://rancher.com/docs/k3s/latest/en/installation/ha/).
 
+
 通过运行 `k3sup install --help` 查看更多安装选项。 
+通过运行 `k3sup join --help` 查看更多节点加入选项。 
+
+
+* 使用master角色加入现有集群
+
+> Note the new `--server` flag
+
+```sh
+export USER=root
+export SERVER_IP=192.168.0.100
+export NEXT_SERVER_IP=192.168.0.101
+
+k3sup join \
+  --ip $NEXT_SERVER_IP \
+  --user $USER \
+  --server-user $USER \
+  --server-ip $SERVER_IP \
+  --server \
+  --k3s-version v1.19.1+k3s1
+```
+
+
+
+* 实例：创建一个集群
+
+集群存在两个master，一个agent
+
+```bash
+export SERVER1=104.248.135.109
+export SERVER2=104.248.25.221
+export AGENT1=104.248.137.25
+```
+
+* 安装第一个master
+
+```bash
+k3sup install --user root --ip $SERVER1 --datastore="${DATASTORE}" --token=${TOKEN}
+```
+
+* 安装第二个master
+
+```bash
+k3sup install --user root --ip $SERVER2 --datastore="${DATASTORE}" --token=${TOKEN}
+```
+
+* 安装 agent
+
+```bash
+k3sup join --user root --server-ip $SERVER1 --ip $AGENT1
+```
+
+注意，如果对代理和服务器使用不同的 SSH 用户名，则必须通过 `--server-user` 参数提供master的用户名。
 
 * 安装后测试:
 
