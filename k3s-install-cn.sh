@@ -99,8 +99,37 @@ set -o noglob
 #     Setup a custom Registry or Mirror
 #     Defaults to null.
 
+# --- helper functions for logs ---
+info() {
+    echo '[INFO] ' "$@"
+}
+warn() {
+    echo '[WARN] ' "$@" >&2
+}
+fatal() {
+    echo '[ERROR] ' "$@" >&2
+    exit 1
+}
+
+
 # --- 国内安装
 INSTALL_K3S_MIRROR=cn
+
+#定制安装
+echo $@
+
+if [ -n "$(echo "$*" | grep "customai")" ]; then
+
+INSTALL_K3S_VERSION=${INSTALL_K3S_VERSION:-'v1.20.15+k3s1'}
+INSTALL_K3S_EXEC="${INSTALL_K3S_EXEC} --disable=traefik --docker "
+
+info "install ai custom version ."
+
+
+else
+    info "install ..."
+fi
+
 
 
 GITHUB_URL=https://github.com/k3s-io/k3s/releases
@@ -108,20 +137,690 @@ STORAGE_URL=https://k3s-ci-builds.s3.amazonaws.com
 DOWNLOADER=
 INSTALL_K3S_MIRROR_URL=${INSTALL_K3S_MIRROR_URL:-'rancher-mirror.rancher.cn'}
 
-# --- helper functions for logs ---
-info()
-{
-    echo '[INFO] ' "$@"
+
+
+##docker env
+
+SCRIPT_COMMIT_SHA="e5543d473431b782227f8908005543bb4389b8de"
+
+CHANNEL="stable"
+DOWNLOAD_URL="https://download.docker.com"
+REPO_FILE="docker-ce.repo"
+VERSION="24.0.7"
+DIND_TEST_WAIT=${DIND_TEST_WAIT:-3s}  # Wait time until docker start at dind test env
+mirror='Aliyun'
+DRY_RUN=${DRY_RUN:-}
+
+
+# Issue https://github.com/rancher/rancher/issues/29246
+
+
+
+
+
+
+
+
+
+#verify_docker
+
+
+
+
+adjust_repo_releasever() {
+	DOWNLOAD_URL="https://download.docker.com"
+	case $1 in
+	7*)
+		releasever=7
+		;;
+	8*)
+		releasever=8
+		;;
+	*)
+		# fedora, or unsupported
+		return
+		;;
+	esac
+
+	for channel in "stable" "test" "nightly"; do
+		$sh_c "$config_manager --setopt=docker-ce-${channel}.baseurl=${DOWNLOAD_URL}/linux/centos/${releasever}/\\\$basearch/${channel} --save";
+		$sh_c "$config_manager --setopt=docker-ce-${channel}-debuginfo.baseurl=${DOWNLOAD_URL}/linux/centos/${releasever}/debug-\\\$basearch/${channel} --save";
+		$sh_c "$config_manager --setopt=docker-ce-${channel}-source.baseurl=${DOWNLOAD_URL}/linux/centos/${releasever}/source/${channel} --save";
+	done
 }
-warn()
-{
-    echo '[WARN] ' "$@" >&2
+
+start_docker() {
+	if [ ! -z $DIND_TEST ]; then
+		# Starting dockerd manually due to dind env is not using systemd
+		dockerd &
+		sleep $DIND_TEST_WAIT
+	elif [ -d '/run/systemd/system' ] ; then
+		$sh_c 'systemctl start docker'
+	else
+		$sh_c 'service docker start'
+	fi
 }
-fatal()
-{
-    echo '[ERROR] ' "$@" >&2
-    exit 1
+
+
+command_exists() {
+	command -v "$@" > /dev/null 2>&1
 }
+
+# version_gte checks if the version specified in $VERSION is at least the given
+# SemVer (Maj.Minor[.Patch]), or CalVer (YY.MM) version.It returns 0 (success)
+# if $VERSION is either unset (=latest) or newer or equal than the specified
+# version, or returns 1 (fail) otherwise.
+#
+# examples:
+#
+# VERSION=23.0
+# version_gte 23.0  // 0 (success)
+# version_gte 20.10 // 0 (success)
+# version_gte 19.03 // 0 (success)
+# version_gte 21.10 // 1 (fail)
+version_gte() {
+	if [ -z "$VERSION" ]; then
+			return 0
+	fi
+	eval version_compare "$VERSION" "$1"
+}
+
+# version_compare compares two version strings (either SemVer (Major.Minor.Path),
+# or CalVer (YY.MM) version strings. It returns 0 (success) if version A is newer
+# or equal than version B, or 1 (fail) otherwise. Patch releases and pre-release
+# (-alpha/-beta) are not taken into account
+#
+# examples:
+#
+# version_compare 23.0.0 20.10 // 0 (success)
+# version_compare 23.0 20.10   // 0 (success)
+# version_compare 20.10 19.03  // 0 (success)
+# version_compare 20.10 20.10  // 0 (success)
+# version_compare 19.03 20.10  // 1 (fail)
+version_compare() (
+	set +x
+
+	yy_a="$(echo "$1" | cut -d'.' -f1)"
+	yy_b="$(echo "$2" | cut -d'.' -f1)"
+	if [ "$yy_a" -lt "$yy_b" ]; then
+		return 1
+	fi
+	if [ "$yy_a" -gt "$yy_b" ]; then
+		return 0
+	fi
+	mm_a="$(echo "$1" | cut -d'.' -f2)"
+	mm_b="$(echo "$2" | cut -d'.' -f2)"
+
+	# trim leading zeros to accommodate CalVer
+	mm_a="${mm_a#0}"
+	mm_b="${mm_b#0}"
+
+	if [ "${mm_a:-0}" -lt "${mm_b:-0}" ]; then
+		return 1
+	fi
+
+	return 0
+)
+
+is_dry_run() {
+	if [ -z "$DRY_RUN" ]; then
+		return 1
+	else
+		return 0
+	fi
+}
+
+is_wsl() {
+	case "$(uname -r)" in
+	*microsoft* ) true ;; # WSL 2
+	*Microsoft* ) true ;; # WSL 1
+	* ) false;;
+	esac
+}
+
+is_darwin() {
+	case "$(uname -s)" in
+	*darwin* ) true ;;
+	*Darwin* ) true ;;
+	* ) false;;
+	esac
+}
+
+deprecation_notice() {
+	distro=$1
+	distro_version=$2
+	echo
+	printf "\033[91;1mDEPRECATION WARNING\033[0m\n"
+	printf "    This Linux distribution (\033[1m%s %s\033[0m) reached end-of-life and is no longer supported by this script.\n" "$distro" "$distro_version"
+	echo   "    No updates or security fixes will be released for this distribution, and users are recommended"
+	echo   "    to upgrade to a currently maintained version of $distro."
+	echo
+	printf   "Press \033[1mCtrl+C\033[0m now to abort this script, or wait for the installation to continue."
+	echo
+	sleep 10
+}
+
+get_distribution() {
+	lsb_dist=""
+	# Every system that we officially support has /etc/os-release
+	if [ -r /etc/os-release ]; then
+		lsb_dist="$(. /etc/os-release && echo "$ID")"
+	fi
+	# Returning an empty string here should be alright since the
+	# case statements don't act unless you provide an actual value
+	echo "$lsb_dist"
+}
+
+echo_docker_as_nonroot() {
+	if is_dry_run; then
+		return
+	fi
+	if command_exists docker && [ -e /var/run/docker.sock ]; then
+		(
+			set -x
+			$sh_c 'docker version'
+		) || true
+	fi
+
+	# intentionally mixed spaces and tabs here -- tabs are stripped by "<<-EOF", spaces are kept in the output
+	echo
+	echo "================================================================================"
+	echo
+	if version_gte "20.10"; then
+		echo "To run Docker as a non-privileged user, consider setting up the"
+		echo "Docker daemon in rootless mode for your user:"
+		echo
+		echo "    dockerd-rootless-setuptool.sh install"
+		echo
+		echo "Visit https://docs.docker.com/go/rootless/ to learn about rootless mode."
+		echo
+	fi
+	echo
+	echo "To run the Docker daemon as a fully privileged service, but granting non-root"
+	echo "users access, refer to https://docs.docker.com/go/daemon-access/"
+	echo
+	echo "WARNING: Access to the remote API on a privileged Docker daemon is equivalent"
+	echo "         to root access on the host. Refer to the 'Docker daemon attack surface'"
+	echo "         documentation for details: https://docs.docker.com/go/attack-surface/"
+	echo
+	echo "================================================================================"
+	echo
+}
+
+# Check if this is a forked Linux distro
+check_forked() {
+
+	# Check for lsb_release command existence, it usually exists in forked distros
+	if command_exists lsb_release; then
+		# Check if the `-u` option is supported
+		set +e
+		lsb_release -a -u > /dev/null 2>&1
+		lsb_release_exit_code=$?
+		set -e
+
+		# Check if the command has exited successfully, it means we're in a forked distro
+		if [ "$lsb_release_exit_code" = "0" ]; then
+			# Print info about current distro
+			cat <<-EOF
+			You're using '$lsb_dist' version '$dist_version'.
+			EOF
+
+			# Get the upstream release info
+			lsb_dist=$(lsb_release -a -u 2>&1 | tr '[:upper:]' '[:lower:]' | grep -E 'id' | cut -d ':' -f 2 | tr -d '[:space:]')
+			dist_version=$(lsb_release -a -u 2>&1 | tr '[:upper:]' '[:lower:]' | grep -E 'codename' | cut -d ':' -f 2 | tr -d '[:space:]')
+
+			# Print info about upstream distro
+			cat <<-EOF
+			Upstream release is '$lsb_dist' version '$dist_version'.
+			EOF
+		else
+			if [ -r /etc/debian_version ] && [ "$lsb_dist" != "ubuntu" ] && [ "$lsb_dist" != "raspbian" ]; then
+				if [ "$lsb_dist" = "osmc" ]; then
+					# OSMC runs Raspbian
+					lsb_dist=raspbian
+				else
+					# We're Debian and don't even know it!
+					lsb_dist=debian
+				fi
+				dist_version="$(sed 's/\/.*//' /etc/debian_version | sed 's/\..*//')"
+				case "$dist_version" in
+					12)
+						dist_version="bookworm"
+					;;
+					11)
+						dist_version="bullseye"
+					;;
+					10)
+						dist_version="buster"
+					;;
+					9)
+						dist_version="stretch"
+					;;
+					8)
+						dist_version="jessie"
+					;;
+				esac
+			fi
+		fi
+	fi
+}
+
+do_install() {
+	echo "# Executing docker install script, commit: $SCRIPT_COMMIT_SHA"
+
+	if command_exists docker; then
+		cat >&2 <<-'EOF'
+			Warning: the "docker" command appears to already exist on this system.
+
+			skping..
+			
+		EOF
+		return 1
+	fi
+
+	user="$(id -un 2>/dev/null || true)"
+
+	sh_c='sh -c'
+	if [ "$user" != 'root' ]; then
+		if command_exists sudo; then
+			sh_c='sudo -E sh -c'
+		elif command_exists su; then
+			sh_c='su -c'
+		else
+			cat >&2 <<-'EOF'
+			Error: this installer needs the ability to run commands as root.
+			We are unable to find either "sudo" or "su" available to make this happen.
+			EOF
+			exit 1
+		fi
+	fi
+
+	if is_dry_run; then
+		sh_c="echo"
+	fi
+
+	# perform some very rudimentary platform detection
+	lsb_dist=$( get_distribution )
+	lsb_dist="$(echo "$lsb_dist" | tr '[:upper:]' '[:lower:]')"
+
+	if is_wsl; then
+		echo
+		echo "WSL DETECTED: We recommend using Docker Desktop for Windows."
+		echo "Please get Docker Desktop from https://www.docker.com/products/docker-desktop/"
+		echo
+		cat >&2 <<-'EOF'
+
+			You may press Ctrl+C now to abort this script.
+		EOF
+		( set -x; sleep 20 )
+	fi
+
+	case "$lsb_dist" in
+
+		ubuntu)
+			if command_exists lsb_release; then
+				dist_version="$(lsb_release --codename | cut -f2)"
+			fi
+			if [ -z "$dist_version" ] && [ -r /etc/lsb-release ]; then
+				dist_version="$(. /etc/lsb-release && echo "$DISTRIB_CODENAME")"
+			fi
+		;;
+
+		debian|raspbian)
+			dist_version="$(sed 's/\/.*//' /etc/debian_version | sed 's/\..*//')"
+			case "$dist_version" in
+				12)
+					dist_version="bookworm"
+				;;
+				11)
+					dist_version="bullseye"
+				;;
+				10)
+					dist_version="buster"
+				;;
+				9)
+					dist_version="stretch"
+				;;
+				8)
+					dist_version="jessie"
+				;;
+			esac
+		;;
+
+		centos|rhel|sles|rocky)
+			if [ -z "$dist_version" ] && [ -r /etc/os-release ]; then
+				dist_version="$(. /etc/os-release && echo "$VERSION_ID")"
+			fi
+
+			
+		;;
+
+		oracleserver|ol)
+			lsb_dist="ol"
+			# need to switch lsb_dist to match yum repo URL
+			dist_version="$(rpm -q --whatprovides redhat-release --queryformat "%{VERSION}\n" | sed 's/\/.*//' | sed 's/\..*//' | sed 's/Server*//')"
+		;;
+
+		*)
+			if command_exists lsb_release; then
+				dist_version="$(lsb_release --release | cut -f2)"
+			fi
+			if [ -z "$dist_version" ] && [ -r /etc/os-release ]; then
+				dist_version="$(. /etc/os-release && echo "$VERSION_ID")"
+			fi
+		;;
+
+	esac
+
+	# Check if this is a forked Linux distro
+	check_forked
+
+	# Print deprecation warnings for distro versions that recently reached EOL,
+	# but may still be commonly used (especially LTS versions).
+	case "$lsb_dist.$dist_version" in
+		debian.stretch|debian.jessie)
+			deprecation_notice "$lsb_dist" "$dist_version"
+			;;
+		raspbian.stretch|raspbian.jessie)
+			deprecation_notice "$lsb_dist" "$dist_version"
+			;;
+		ubuntu.xenial|ubuntu.trusty)
+			deprecation_notice "$lsb_dist" "$dist_version"
+			;;
+		ubuntu.impish|ubuntu.hirsute|ubuntu.groovy|ubuntu.eoan|ubuntu.disco|ubuntu.cosmic)
+			deprecation_notice "$lsb_dist" "$dist_version"
+			;;
+		fedora.*)
+			if [ "$dist_version" -lt 36 ]; then
+				deprecation_notice "$lsb_dist" "$dist_version"
+			fi
+			;;
+	esac
+
+	# Run setup for each distro accordingly
+	case "$lsb_dist" in
+		ubuntu|debian|raspbian)
+			pre_reqs="apt-transport-https ca-certificates curl"
+			if ! command -v gpg > /dev/null; then
+				pre_reqs="$pre_reqs gnupg"
+			fi
+			apt_repo="deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] $DOWNLOAD_URL/linux/$lsb_dist $dist_version $CHANNEL"
+			(
+				if ! is_dry_run; then
+					set -x
+				fi
+				$sh_c 'apt-get update -qq >/dev/null'
+				$sh_c "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $pre_reqs >/dev/null"
+				$sh_c 'install -m 0755 -d /etc/apt/keyrings'
+				$sh_c "curl -fsSL \"$DOWNLOAD_URL/linux/$lsb_dist/gpg\" | gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg"
+				$sh_c "chmod a+r /etc/apt/keyrings/docker.gpg"
+				$sh_c "echo \"$apt_repo\" > /etc/apt/sources.list.d/docker.list"
+				$sh_c 'apt-get update -qq >/dev/null'
+			)
+			pkg_version=""
+			if [ -n "$VERSION" ]; then
+				if is_dry_run; then
+					echo "# WARNING: VERSION pinning is not supported in DRY_RUN"
+				else
+					# Will work for incomplete versions IE (17.12), but may not actually grab the "latest" if in the test channel
+					pkg_pattern="$(echo "$VERSION" | sed 's/-ce-/~ce~.*/g' | sed 's/-/.*/g')"
+					search_command="apt-cache madison docker-ce | grep '$pkg_pattern' | head -1 | awk '{\$1=\$1};1' | cut -d' ' -f 3"
+					pkg_version="$($sh_c "$search_command")"
+					echo "INFO: Searching repository for VERSION '$VERSION'"
+					echo "INFO: $search_command"
+					if [ -z "$pkg_version" ]; then
+						echo
+						echo "ERROR: '$VERSION' not found amongst apt-cache madison results"
+						echo
+						exit 1
+					fi
+					if version_gte "18.09"; then
+							search_command="apt-cache madison docker-ce-cli | grep '$pkg_pattern' | head -1 | awk '{\$1=\$1};1' | cut -d' ' -f 3"
+							echo "INFO: $search_command"
+							cli_pkg_version="=$($sh_c "$search_command")"
+					fi
+					pkg_version="=$pkg_version"
+				fi
+			fi
+			(
+				pkgs="docker-ce${pkg_version%=}"
+				if version_gte "18.09"; then
+						# older versions didn't ship the cli and containerd as separate packages
+						pkgs="$pkgs docker-ce-cli${cli_pkg_version%=} containerd.io"
+				fi
+				if version_gte "20.10"; then
+						pkgs="$pkgs docker-compose-plugin docker-ce-rootless-extras$pkg_version"
+				fi
+				if version_gte "23.0"; then
+						pkgs="$pkgs docker-buildx-plugin"
+				fi
+				if ! is_dry_run; then
+					set -x
+				fi
+				$sh_c "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $pkgs >/dev/null"
+				start_docker
+			)
+			echo_docker_as_nonroot
+			exit 0
+			;;
+		centos|fedora|rhel|ol|rocky)
+			if [ "$lsb_dist" = "fedora" ]; then
+				pkg_manager="dnf"
+				config_manager="dnf config-manager"
+				enable_channel_flag="--set-enabled"
+				disable_channel_flag="--set-disabled"
+				pre_reqs="dnf-plugins-core"
+				pkg_suffix="fc$dist_version"
+			else
+				pkg_manager="yum"
+				config_manager="yum-config-manager"
+				enable_channel_flag="--enable"
+				disable_channel_flag="--disable"
+				pre_reqs="yum-utils"
+				pkg_suffix="el"
+			fi
+			repo_file_url="$DOWNLOAD_URL/linux/$lsb_dist/$REPO_FILE"
+			if [ "$lsb_dist" = "ol" ] || [ "$lsb_dist" = "rocky" ] || [ "$lsb_dist" = "rhel" ]; then
+				repo_file_url="$DOWNLOAD_URL/linux/centos/$REPO_FILE"
+			fi
+			(
+				if ! is_dry_run; then
+					set -x
+				fi
+				$sh_c "$pkg_manager install -y -q $pre_reqs"
+				$sh_c "$config_manager --add-repo $repo_file_url"
+
+				if [ "$CHANNEL" != "stable" ]; then
+					$sh_c "$config_manager $disable_channel_flag 'docker-ce-*'"
+					$sh_c "$config_manager $enable_channel_flag 'docker-ce-$CHANNEL'"
+				fi
+				if [ "$lsb_dist" = "rhel" ] || [ "$lsb_dist" = "ol" ]; then
+					adjust_repo_releasever "$dist_version"
+					# Add extra repo for version 7.x
+					if [[ "$dist_version" =~ "7." ]] || [ "$dist_version" == "7" ] ; then
+						if [ "$lsb_dist" = "rhel" ]; then
+							$sh_c "$config_manager $enable_channel_flag rhui-REGION-rhel-server-extras"
+							$sh_c "$config_manager $enable_channel_flag rhui-rhel-7-server-rhui-extras-rpms"
+							$sh_c "$config_manager $enable_channel_flag rhui-rhel-7-for-arm-64-extras-rhui-rpms"
+							$sh_c "$config_manager $enable_channel_flag rhel-7-server-rhui-extras-rpms"
+							$sh_c "$config_manager $enable_channel_flag rhel-7-server-extras-rpms"
+						else
+							$sh_c "$config_manager $enable_channel_flag ol7_addons"
+							# Adding OL7 developer repo if doesn't exist
+							if [ "$(yum repolist | grep yum.oracle.com_repo_OracleLinux_OL7_developer > /dev/null || echo add)" == "add" ]; then
+								$sh_c "$config_manager --add-repo https://yum.oracle.com/repo/OracleLinux/OL7/developer/x86_64"
+							fi
+						fi
+					fi
+				fi
+				$sh_c "$pkg_manager makecache"
+			)
+			pkg_version=""
+			if [ -n "$VERSION" ]; then
+				if is_dry_run; then
+					echo "# WARNING: VERSION pinning is not supported in DRY_RUN"
+				else
+					pkg_pattern="$(echo "$VERSION" | sed 's/-ce-/\\\\.ce.*/g' | sed 's/-/.*/g').*$pkg_suffix"
+					search_command="$pkg_manager list --showduplicates docker-ce | grep '$pkg_pattern' | tail -1 | awk '{print \$2}'"
+					pkg_version="$($sh_c "$search_command")"
+					echo "INFO: Searching repository for VERSION '$VERSION'"
+					echo "INFO: $search_command"
+					if [ -z "$pkg_version" ]; then
+						echo
+						echo "ERROR: '$VERSION' not found amongst $pkg_manager list results"
+						echo
+						exit 1
+					fi
+					if version_gte "18.09"; then
+						# older versions don't support a cli package
+						search_command="$pkg_manager list --showduplicates docker-ce-cli | grep '$pkg_pattern' | tail -1 | awk '{print \$2}'"
+						cli_pkg_version="$($sh_c "$search_command" | cut -d':' -f 2)"
+					fi
+					# Cut out the epoch and prefix with a '-'
+					pkg_version="-$(echo "$pkg_version" | cut -d':' -f 2)"
+				fi
+			fi
+			(
+				pkgs="docker-ce$pkg_version"
+				if version_gte "18.09"; then
+					# older versions didn't ship the cli and containerd as separate packages
+					if [ -n "$cli_pkg_version" ]; then
+						pkgs="$pkgs docker-ce-cli-$cli_pkg_version containerd.io"
+					else
+						pkgs="$pkgs docker-ce-cli containerd.io"
+					fi
+				fi
+				if version_gte "20.10"; then
+					pkgs="$pkgs docker-compose-plugin docker-ce-rootless-extras$pkg_version"
+				fi
+				if version_gte "23.0"; then
+						pkgs="$pkgs docker-buildx-plugin"
+				fi
+				if ! is_dry_run; then
+					set -x
+				fi
+				$sh_c "$pkg_manager install -y -q $pkgs"
+			)
+			echo_docker_as_nonroot
+			exit 0
+			;;
+		sles)
+			if [ "$(uname -m)" != "s390x" ]; then
+				echo "Packages for SLES are currently only available for s390x"
+				exit 1
+			fi
+			if [ "$dist_version" = "15.3" ]; then
+				sles_version="SLE_15_SP3"
+			else
+				sles_version="SLE_15_SP2"
+			fi
+			repo_file_url="$DOWNLOAD_URL/linux/$lsb_dist/$REPO_FILE"
+			pre_reqs="ca-certificates curl libseccomp2 awk"
+			(
+				if ! is_dry_run; then
+					set -x
+				fi
+				$sh_c "zypper install -y $pre_reqs"
+				$sh_c "zypper addrepo $repo_file_url"
+				if ! is_dry_run; then
+						cat >&2 <<-'EOF'
+						WARNING!!
+						openSUSE repository (https://download.opensuse.org/repositories/security:SELinux) will be enabled now.
+						Do you wish to continue?
+						You may press Ctrl+C now to abort this script.
+						EOF
+						( set -x; sleep 30 )
+				fi
+				opensuse_repo="https://download.opensuse.org/repositories/security:SELinux/$sles_version/security:SELinux.repo"
+				$sh_c "zypper addrepo $opensuse_repo"
+				$sh_c "zypper --gpg-auto-import-keys refresh"
+				$sh_c "zypper lr -d"
+			)
+			pkg_version=""
+			if [ -n "$VERSION" ]; then
+				if is_dry_run; then
+					echo "# WARNING: VERSION pinning is not supported in DRY_RUN"
+				else
+					pkg_pattern="$(echo "$VERSION" | sed 's/-ce-/\\\\.ce.*/g' | sed 's/-/.*/g')"
+					search_command="zypper search -s --match-exact 'docker-ce' | grep '$pkg_pattern' | tail -1 | awk '{print \$6}'"
+					pkg_version="$($sh_c "$search_command")"
+					echo "INFO: Searching repository for VERSION '$VERSION'"
+					echo "INFO: $search_command"
+					if [ -z "$pkg_version" ]; then
+						echo
+						echo "ERROR: '$VERSION' not found amongst zypper list results"
+						echo
+						exit 1
+					fi
+					search_command="zypper search -s --match-exact 'docker-ce-cli' | grep '$pkg_pattern' | tail -1 | awk '{print \$6}'"
+					# It's okay for cli_pkg_version to be blank, since older versions don't support a cli package
+					cli_pkg_version="$($sh_c "$search_command")"
+					pkg_version="-$pkg_version"
+				fi
+			fi
+			(
+				pkgs="docker-ce$pkg_version"
+				if version_gte "18.09"; then
+					if [ -n "$cli_pkg_version" ]; then
+						# older versions didn't ship the cli and containerd as separate packages
+						pkgs="$pkgs docker-ce-cli-$cli_pkg_version containerd.io"
+					else
+						pkgs="$pkgs docker-ce-cli containerd.io"
+					fi
+				fi
+				if version_gte "20.10"; then
+					pkgs="$pkgs docker-compose-plugin docker-ce-rootless-extras$pkg_version"
+				fi
+				if version_gte "23.0"; then
+						pkgs="$pkgs docker-buildx-plugin"
+				fi
+				if ! is_dry_run; then
+					set -x
+				fi
+				$sh_c "zypper -q install -y $pkgs"
+				if ! command_exists iptables; then
+                    $sh_c "$pkg_manager install -y -q iptables"
+                fi
+                start_docker
+			)
+			echo_docker_as_nonroot
+			exit 0
+			;;
+                rancheros)
+                        (
+                        set -x
+                        $sh_c "sleep 3;ros engine list --update"
+                        engine_version="$(sudo ros engine list | awk '{print $2}' | grep ${docker_version} | tail -n 1)"
+                        if [ "$engine_version" != "" ]; then
+                                $sh_c "ros engine switch -f $engine_version"
+                        fi
+                        )
+                        exit 0
+                        ;;
+		*)
+			if [ -z "$lsb_dist" ]; then
+				if is_darwin; then
+					echo
+					echo "ERROR: Unsupported operating system 'macOS'"
+					echo "Please get Docker Desktop from https://www.docker.com/products/docker-desktop"
+					echo
+					exit 1
+				fi
+			fi
+			echo
+			echo "ERROR: Unsupported distribution '$lsb_dist'"
+			echo
+			exit 1
+			;;
+	esac
+	exit 1
+}
+
+
+
+
+
+
 
 # --- fatal if no systemd or openrc ---
 verify_system() {
@@ -129,7 +828,7 @@ verify_system() {
         HAS_OPENRC=true
         return
     fi
-    if [ -x /bin/systemctl ] || type systemctl > /dev/null 2>&1; then
+    if [ -x /bin/systemctl ] || type systemctl >/dev/null 2>&1; then
         HAS_SYSTEMD=true
         return
     fi
@@ -164,13 +863,13 @@ escape_dq() {
 # --- ensures $K3S_URL is empty or begins with https://, exiting fatally otherwise ---
 verify_k3s_url() {
     case "${K3S_URL}" in
-        "")
-            ;;
-        https://*)
-            ;;
-        *)
-            fatal "Only https:// URLs are supported for K3S_URL (have ${K3S_URL})"
-            ;;
+    "") ;;
+
+    https://*) ;;
+
+    *)
+        fatal "Only https:// URLs are supported for K3S_URL (have ${K3S_URL})"
+        ;;
     esac
 }
 
@@ -178,15 +877,15 @@ verify_k3s_url() {
 setup_registry() {
     REGISTRIES_FILE="/etc/rancher/k3s/registries.yaml"
     if [ "${INSTALL_K3S_REGISTRIES}" -a ! -f "$REGISTRIES_FILE" ]; then
-        INSTALL_K3S_REGISTRIES=`echo ${INSTALL_K3S_REGISTRIES} | awk '{gsub(/,/," "); print $0}'`
-        $SUDO mkdir -p `dirname $REGISTRIES_FILE`
-        $SUDO cat >> $REGISTRIES_FILE <<EOF
+        INSTALL_K3S_REGISTRIES=$(echo ${INSTALL_K3S_REGISTRIES} | awk '{gsub(/,/," "); print $0}')
+        $SUDO mkdir -p $(dirname $REGISTRIES_FILE)
+        $SUDO cat >>$REGISTRIES_FILE <<EOF
 mirrors:
   "docker.io":
     endpoint:
 EOF
         for registry in ${INSTALL_K3S_REGISTRIES}; do
-            echo "      - $registry" >> "$REGISTRIES_FILE"
+            echo "      - $registry" >>"$REGISTRIES_FILE"
         done
     fi
 }
@@ -195,21 +894,21 @@ EOF
 setup_env() {
     # --- use command args if passed or create default ---
     case "$1" in
-        # --- if we only have flags discover if command should be server or agent ---
-        (-*|"")
-            if [ -z "${K3S_URL}" ]; then
-                CMD_K3S=server
-            else
-                if [ -z "${K3S_TOKEN}" ] && [ -z "${K3S_TOKEN_FILE}" ]; then
-                    fatal "Defaulted k3s exec command to 'agent' because K3S_URL is defined, but K3S_TOKEN or K3S_TOKEN_FILE is not defined."
-                fi
-                CMD_K3S=agent
+    # --- if we only have flags discover if command should be server or agent ---
+    -* | "")
+        if [ -z "${K3S_URL}" ]; then
+            CMD_K3S=server
+        else
+            if [ -z "${K3S_TOKEN}" ] && [ -z "${K3S_TOKEN_FILE}" ]; then
+                fatal "Defaulted k3s exec command to 'agent' because K3S_URL is defined, but K3S_TOKEN or K3S_TOKEN_FILE is not defined."
             fi
+            CMD_K3S=agent
+        fi
         ;;
         # --- command is provided ---
-        (*)
-            CMD_K3S=$1
-            shift
+    *)
+        CMD_K3S=$1
+        shift
         ;;
     esac
 
@@ -229,8 +928,8 @@ setup_env() {
     fi
 
     # --- check for invalid characters in system name ---
-    valid_chars=$(printf '%s' "${SYSTEM_NAME}" | sed -e 's/[][!#$%&()*;<=>?\_`{|}/[:space:]]/^/g;' )
-    if [ "${SYSTEM_NAME}" != "${valid_chars}"  ]; then
+    valid_chars=$(printf '%s' "${SYSTEM_NAME}" | sed -e 's/[][!#$%&()*;<=>?\_`{|}/[:space:]]/^/g;')
+    if [ "${SYSTEM_NAME}" != "${valid_chars}" ]; then
         invalid_chars=$(printf '%s' "${valid_chars}" | sed -e 's/[^^]/ /g')
         fatal "Invalid characters for system name:
             ${SYSTEM_NAME}
@@ -309,11 +1008,11 @@ can_skip_download_binary() {
     fi
 }
 
-can_skip_download_selinux() {                                                        
-    if [ "${INSTALL_K3S_SKIP_DOWNLOAD}" != true ] && [ "${INSTALL_K3S_SKIP_DOWNLOAD}" != selinux ]; then 
-        return 1                                                                     
-    fi                                                                               
-}  
+can_skip_download_selinux() {
+    if [ "${INSTALL_K3S_SKIP_DOWNLOAD}" != true ] && [ "${INSTALL_K3S_SKIP_DOWNLOAD}" != selinux ]; then
+        return 1
+    fi
+}
 
 # --- verify an executable k3s binary is installed ---
 verify_k3s_is_executable() {
@@ -328,32 +1027,33 @@ setup_verify_arch() {
         ARCH=$(uname -m)
     fi
     case $ARCH in
-        amd64)
-            ARCH=amd64
-            SUFFIX=
-            ;;
-        x86_64)
-            ARCH=amd64
-            SUFFIX=
-            ;;
-        arm64)
-            ARCH=arm64
-            SUFFIX=-${ARCH}
-            ;;
-        s390x)
-            ARCH=s390x
-            SUFFIX=-${ARCH}
-            ;;
-        aarch64)
-            ARCH=arm64
-            SUFFIX=-${ARCH}
-            ;;
-        arm*)
-            ARCH=arm
-            SUFFIX=-${ARCH}hf
-            ;;
-        *)
-            fatal "Unsupported architecture $ARCH"
+    amd64)
+        ARCH=amd64
+        SUFFIX=
+        ;;
+    x86_64)
+        ARCH=amd64
+        SUFFIX=
+        ;;
+    arm64)
+        ARCH=arm64
+        SUFFIX=-${ARCH}
+        ;;
+    s390x)
+        ARCH=s390x
+        SUFFIX=-${ARCH}
+        ;;
+    aarch64)
+        ARCH=arm64
+        SUFFIX=-${ARCH}
+        ;;
+    arm*)
+        ARCH=arm
+        SUFFIX=-${ARCH}hf
+        ;;
+    *)
+        fatal "Unsupported architecture $ARCH"
+        ;;
     esac
 }
 
@@ -392,23 +1092,23 @@ get_release_version() {
         info "Finding release for channel ${INSTALL_K3S_CHANNEL}"
         version_url="${INSTALL_K3S_CHANNEL_URL}/${INSTALL_K3S_CHANNEL}"
         case $DOWNLOADER in
-            curl)
-                if [ "${INSTALL_K3S_MIRROR}" = cn ]; then
-                    VERSION_K3S=$(curl -s -S ${version_url})
-                else
-                    VERSION_K3S=$(curl -w '%{url_effective}' -L -s -S ${version_url} -o /dev/null | sed -e 's|.*/||')
-                fi
-                ;;
-            wget)
-                if [ "${INSTALL_K3S_MIRROR}" = cn ]; then
-                    VERSION_K3S=$(wget -qO - ${version_url})
-                else
-                    VERSION_K3S=$(wget -SqO /dev/null ${version_url} 2>&1 | grep -i Location | sed -e 's|.*/||')
-                fi
-                ;;
-            *)
-                fatal "Incorrect downloader executable '$DOWNLOADER'"
-                ;;
+        curl)
+            if [ "${INSTALL_K3S_MIRROR}" = cn ]; then
+                VERSION_K3S=$(curl -s -S ${version_url})
+            else
+                VERSION_K3S=$(curl -w '%{url_effective}' -L -s -S ${version_url} -o /dev/null | sed -e 's|.*/||')
+            fi
+            ;;
+        wget)
+            if [ "${INSTALL_K3S_MIRROR}" = cn ]; then
+                VERSION_K3S=$(wget -qO - ${version_url})
+            else
+                VERSION_K3S=$(wget -SqO /dev/null ${version_url} 2>&1 | grep -i Location | sed -e 's|.*/||')
+            fi
+            ;;
+        *)
+            fatal "Incorrect downloader executable '$DOWNLOADER'"
+            ;;
         esac
     fi
     info "Using ${VERSION_K3S} as release"
@@ -418,27 +1118,27 @@ get_release_version() {
 get_k3s_selinux_version() {
     available_version="k3s-selinux-1.2-2.${rpm_target}.noarch.rpm"
     info "Finding available k3s-selinux versions"
-    
+
     # run verify_downloader in case it binary installation was skipped
     verify_downloader curl || verify_downloader wget || fatal 'Can not find curl or wget for downloading files'
 
     case $DOWNLOADER in
-        curl)
-            DOWNLOADER_OPTS="-s"
-            ;;
-        wget)
-            DOWNLOADER_OPTS="-q -O -"
-            ;;
-        *)
-            fatal "Incorrect downloader executable '$DOWNLOADER'"
-            ;;
+    curl)
+        DOWNLOADER_OPTS="-s"
+        ;;
+    wget)
+        DOWNLOADER_OPTS="-q -O -"
+        ;;
+    *)
+        fatal "Incorrect downloader executable '$DOWNLOADER'"
+        ;;
     esac
     for i in {1..3}; do
         set +e
         if [ "${rpm_channel}" = "testing" ]; then
-            version=$(timeout 5 ${DOWNLOADER} ${DOWNLOADER_OPTS} https://api.github.com/repos/k3s-io/k3s-selinux/releases |  grep browser_download_url | awk '{ print $2 }' | grep -oE "[^\/]+${rpm_target}\.noarch\.rpm" | head -n 1)
+            version=$(timeout 5 ${DOWNLOADER} ${DOWNLOADER_OPTS} https://api.github.com/repos/k3s-io/k3s-selinux/releases | grep browser_download_url | awk '{ print $2 }' | grep -oE "[^\/]+${rpm_target}\.noarch\.rpm" | head -n 1)
         else
-            version=$(timeout 5 ${DOWNLOADER} ${DOWNLOADER_OPTS} https://api.github.com/repos/k3s-io/k3s-selinux/releases/latest |  grep browser_download_url | awk '{ print $2 }' | grep -oE "[^\/]+${rpm_target}\.noarch\.rpm")
+            version=$(timeout 5 ${DOWNLOADER} ${DOWNLOADER_OPTS} https://api.github.com/repos/k3s-io/k3s-selinux/releases/latest | grep browser_download_url | awk '{ print $2 }' | grep -oE "[^\/]+${rpm_target}\.noarch\.rpm")
         fi
         set -e
         if [ "${version}" != "" ]; then
@@ -458,15 +1158,15 @@ download() {
     [ $# -eq 2 ] || fatal 'download needs exactly 2 arguments'
 
     case $DOWNLOADER in
-        curl)
-            curl -o $1 -sfL $2
-            ;;
-        wget)
-            wget -qO $1 $2
-            ;;
-        *)
-            fatal "Incorrect executable '$DOWNLOADER'"
-            ;;
+    curl)
+        curl -o $1 -sfL $2
+        ;;
+    wget)
+        wget -qO $1 $2
+        ;;
+    *)
+        fatal "Incorrect executable '$DOWNLOADER'"
+        ;;
     esac
 
     # Abort if download command failed
@@ -478,7 +1178,7 @@ download_hash() {
     if [ -n "${INSTALL_K3S_COMMIT}" ]; then
         HASH_URL=${STORAGE_URL}/k3s${SUFFIX}-${INSTALL_K3S_COMMIT}.sha256sum
     elif [ "${INSTALL_K3S_MIRROR}" = cn ]; then
-        VERSION_K3S=$( echo ${VERSION_K3S} | sed 's/+/-/g' )
+        VERSION_K3S=$(echo ${VERSION_K3S} | sed 's/+/-/g')
         HASH_URL=${INSTALL_K3S_MIRROR_URL}/k3s/${VERSION_K3S}/sha256sum-${ARCH}.txt
     else
         HASH_URL=${GITHUB_URL}/download/${VERSION_K3S}/sha256sum-${ARCH}.txt
@@ -506,7 +1206,7 @@ download_binary() {
     if [ -n "${INSTALL_K3S_COMMIT}" ]; then
         BIN_URL=${STORAGE_URL}/k3s${SUFFIX}-${INSTALL_K3S_COMMIT}
     elif [ "${INSTALL_K3S_MIRROR}" = cn ]; then
-        VERSION_K3S=$( echo ${VERSION_K3S} | sed 's/+/-/g' )
+        VERSION_K3S=$(echo ${VERSION_K3S} | sed 's/+/-/g')
         BIN_URL=${INSTALL_K3S_MIRROR_URL}/k3s/${VERSION_K3S}/k3s${SUFFIX}
     else
         BIN_URL=${GITHUB_URL}/download/${VERSION_K3S}/k3s${SUFFIX}
@@ -535,16 +1235,16 @@ setup_binary() {
 
 # --- setup selinux policy ---
 setup_selinux() {
-    case ${INSTALL_K3S_CHANNEL} in 
-        *testing)
-            rpm_channel=testing
-            ;;
-        *latest)
-            rpm_channel=latest
-            ;;
-        *)
-            rpm_channel=stable
-            ;;
+    case ${INSTALL_K3S_CHANNEL} in
+    *testing)
+        rpm_channel=testing
+        ;;
+    *latest)
+        rpm_channel=latest
+        ;;
+    *)
+        rpm_channel=stable
+        ;;
     esac
 
     rpm_site="rpm.rancher.io"
@@ -553,11 +1253,11 @@ setup_selinux() {
     fi
 
     [ -r /etc/os-release ] && . /etc/os-release
-    if [ `expr "${ID_LIKE}" : ".*suse.*"` != 0 ]; then
+    if [ $(expr "${ID_LIKE}" : ".*suse.*") != 0 ]; then
         rpm_target=sle
         rpm_site_infix=microos
         package_installer=zypper
-        if [ "${ID_LIKE:-}" = suse ] && ( [ "${VARIANT_ID:-}" = sle-micro ] || [ "${ID:-}" = sle-micro ] ); then
+        if [ "${ID_LIKE:-}" = suse ] && ([ "${VARIANT_ID:-}" = sle-micro ] || [ "${ID:-}" = sle-micro ]); then
             rpm_target=sle
             rpm_site_infix=slemicro
             package_installer=zypper
@@ -631,7 +1331,7 @@ install_selinux_rpm() {
             $SUDO yum install -y yum-utils
             $SUDO yum-config-manager --enable rhel-7-server-extras-rpms
         fi
-        $SUDO tee ${repodir}/rancher-k3s-common.repo >/dev/null << EOF
+        $SUDO tee ${repodir}/rancher-k3s-common.repo >/dev/null <<EOF
 [rancher-k3s-common-${2}]
 name=Rancher K3s Common (${2})
 baseurl=https://${1}/k3s/${2}/common/${4}/noarch
@@ -663,7 +1363,7 @@ EOF
         if [ "${rpm_installer}" = "yum" ] && [ -x /usr/bin/dnf ]; then
             rpm_installer=dnf
         fi
-	    if rpm -q --quiet k3s-selinux; then 
+        if rpm -q --quiet k3s-selinux; then
             # remove k3s-selinux module before upgrade to allow container-selinux to upgrade safely
             if check_available_upgrades container-selinux ${3} && check_available_upgrades k3s-selinux ${3}; then
                 MODULE_PRIORITY=$($SUDO semodule --list=full | grep k3s | cut -f1 -d" ")
@@ -681,15 +1381,15 @@ EOF
 check_available_upgrades() {
     set +e
     case ${2} in
-        sle)
-            available_upgrades=$($SUDO zypper -q -t -s 11 se -s -u --type package $1 | tail -n 1 | grep -v "No matching" | awk '{print $3}')
-            ;;
-        coreos)
-            # currently rpm-ostree does not support search functionality https://github.com/coreos/rpm-ostree/issues/1877
-            ;;
-        *)
-            available_upgrades=$($SUDO yum -q --refresh list $1 --upgrades | tail -n 1 | awk '{print $2}')
-            ;;
+    sle)
+        available_upgrades=$($SUDO zypper -q -t -s 11 se -s -u --type package $1 | tail -n 1 | grep -v "No matching" | awk '{print $3}')
+        ;;
+    coreos)
+        # currently rpm-ostree does not support search functionality https://github.com/coreos/rpm-ostree/issues/1877
+        ;;
+    *)
+        available_upgrades=$($SUDO yum -q --refresh list $1 --upgrades | tail -n 1 | awk '{print $2}')
+        ;;
     esac
     set -e
     if [ -n "${available_upgrades}" ]; then
@@ -700,9 +1400,9 @@ check_available_upgrades() {
 # --- download and verify k3s ---
 download_and_verify() {
     if can_skip_download_binary; then
-       info 'Skipping k3s download and verify'
-       verify_k3s_is_executable
-       return
+        info 'Skipping k3s download and verify'
+        verify_k3s_is_executable
+        return
     fi
 
     setup_verify_arch
@@ -745,7 +1445,7 @@ create_symlinks() {
 create_killall() {
     [ "${INSTALL_K3S_BIN_DIR_READ_ONLY}" = true ] && return
     info "Creating killall script ${KILLALL_K3S_SH}"
-    $SUDO tee ${KILLALL_K3S_SH} >/dev/null << \EOF
+    $SUDO tee ${KILLALL_K3S_SH} >/dev/null <<\EOF
 #!/bin/sh
 [ $(id -u) -eq 0 ] || exec sudo $0 $@
 
@@ -845,7 +1545,7 @@ EOF
 create_uninstall() {
     [ "${INSTALL_K3S_BIN_DIR_READ_ONLY}" = true ] && return
     info "Creating uninstall script ${UNINSTALL_K3S_SH}"
-    $SUDO tee ${UNINSTALL_K3S_SH} >/dev/null << EOF
+    $SUDO tee ${UNINSTALL_K3S_SH} >/dev/null <<EOF
 #!/bin/sh
 set -x
 [ \$(id -u) -eq 0 ] || exec sudo \$0 \$@
@@ -926,7 +1626,7 @@ create_env_file() {
 # --- write systemd service file ---
 create_systemd_service_file() {
     info "systemd: Creating service file ${FILE_K3S_SERVICE}"
-    $SUDO tee ${FILE_K3S_SERVICE} >/dev/null << EOF
+    $SUDO tee ${FILE_K3S_SERVICE} >/dev/null <<EOF
 [Unit]
 Description=Lightweight Kubernetes
 Documentation=https://k3s.io
@@ -966,7 +1666,7 @@ create_openrc_service_file() {
     LOG_FILE=/var/log/${SYSTEM_NAME}.log
 
     info "openrc: Creating service file ${FILE_K3S_SERVICE}"
-    $SUDO tee ${FILE_K3S_SERVICE} >/dev/null << EOF
+    $SUDO tee ${FILE_K3S_SERVICE} >/dev/null <<EOF
 #!/sbin/openrc-run
 
 depend() {
@@ -998,7 +1698,7 @@ set +o allexport
 EOF
     $SUDO chmod 0755 ${FILE_K3S_SERVICE}
 
-    $SUDO tee /etc/logrotate.d/${SYSTEM_NAME} >/dev/null << EOF
+    $SUDO tee /etc/logrotate.d/${SYSTEM_NAME} >/dev/null <<EOF
 ${LOG_FILE} {
 	missingok
 	notifempty
@@ -1044,8 +1744,7 @@ openrc_start() {
 
 # --- startup systemd or openrc service ---
 service_enable_and_start() {
-    if [ -f "/proc/cgroups" ] && [ "$(grep memory /proc/cgroups | while read -r n n n enabled; do echo $enabled; done)" -eq 0 ];
-    then
+    if [ -f "/proc/cgroups" ] && [ "$(grep memory /proc/cgroups | while read -r n n n enabled; do echo $enabled; done)" -eq 0 ]; then
         info 'Failed to find memory cgroup, you may need to add "cgroup_memory=1 cgroup_enable=memory" to your linux cmdline (/boot/cmdline.txt on a Raspberry Pi)'
     fi
 
@@ -1062,13 +1761,11 @@ service_enable_and_start() {
         return
     fi
 
-    if command -v iptables-save 1> /dev/null && command -v iptables-restore 1> /dev/null
-    then
-	    $SUDO iptables-save | grep -v KUBE- | grep -iv flannel | $SUDO iptables-restore
+    if command -v iptables-save 1>/dev/null && command -v iptables-restore 1>/dev/null; then
+        $SUDO iptables-save | grep -v KUBE- | grep -iv flannel | $SUDO iptables-restore
     fi
-    if command -v ip6tables-save 1> /dev/null && command -v ip6tables-restore 1> /dev/null
-    then
-	    $SUDO ip6tables-save | grep -v KUBE- | grep -iv flannel | $SUDO ip6tables-restore
+    if command -v ip6tables-save 1>/dev/null && command -v ip6tables-restore 1>/dev/null; then
+        $SUDO ip6tables-save | grep -v KUBE- | grep -iv flannel | $SUDO ip6tables-restore
     fi
 
     [ "${HAS_SYSTEMD}" = true ] && systemd_start
@@ -1076,12 +1773,76 @@ service_enable_and_start() {
     return 0
 }
 
+check_docker(){
+
+
+
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--channel)
+			CHANNEL="$2"
+			shift
+			;;
+		--dry-run)
+			DRY_RUN=1
+			;;
+		--mirror)
+			mirror="$2"
+			shift
+			;;
+		--version)
+			VERSION="${2#v}"
+			shift
+			;;
+		--*)
+			echo "Illegal option $1"
+			;;
+	esac
+	shift $(( $# > 0 ? 1 : 0 ))
+done
+
+case "$mirror" in
+	Aliyun)
+		DOWNLOAD_URL="https://mirrors.aliyun.com/docker-ce"
+		;;
+	AzureChinaCloud)
+		DOWNLOAD_URL="https://mirror.azure.cn/docker-ce"
+		;;
+	"")
+		;;
+	*)
+		>&2 echo "unknown mirror '$mirror': use either 'Aliyun', or 'AzureChinaCloud'."
+		exit 1
+		;;
+esac
+
+case "$CHANNEL" in
+	stable|test)
+		;;
+	edge|nightly)
+		>&2 echo "DEPRECATED: the $CHANNEL channel has been deprecated and is no longer supported by this script."
+		exit 1
+		;;
+	*)
+		>&2 echo "unknown CHANNEL '$CHANNEL': use either stable or test."
+		exit 1
+		;;
+esac
+
+do_install
+
+}
+
+
+
 # --- re-evaluate args to include env command ---
 eval set -- $(escape "${INSTALL_K3S_EXEC}") $(quote "$@")
 
 # --- run the install process --
 {
     verify_system
+    check_docker 
     setup_env "$@"
     download_and_verify
     setup_selinux
@@ -1093,4 +1854,3 @@ eval set -- $(escape "${INSTALL_K3S_EXEC}") $(quote "$@")
     create_service_file
     service_enable_and_start
 }
-
